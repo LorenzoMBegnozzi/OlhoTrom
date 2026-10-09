@@ -33,13 +33,7 @@ OLHO_ESQUERDO_TOPO = 386
 OLHO_ESQUERDO_BASE = 374
 IRIS_ESQUERDA_CENTRO = 473
 
-# Pontos usados como referencia da pose da cabeca (compensam parte do erro
-# introduzido quando a cabeca se move em vez de so os olhos).
-NARIZ_PONTA = 1
-ROSTO_TEMPORA_ESQUERDA = 234
-ROSTO_TEMPORA_DIREITA = 454
-ROSTO_TESTA = 10
-ROSTO_QUEIXO = 152
+NARIZ_PONTA = 1  # usado para aproximar a inclinacao (pitch) da cabeca
 
 
 @dataclass(frozen=True)
@@ -70,6 +64,10 @@ class Configuracoes:
     corte_velocidade: float = 1.0
     # Raio em pixels dentro do qual o cursor simplesmente nao se move.
     zona_morta_px: float = 12.0
+    # Tempo, em segundos, que uma posicao precisa se manter fora da zona morta antes do
+    # cursor de fato se mover. Filtra microssacadas (o olho nunca fica 100% parado); maior
+    # = cursor mais parado mas com mais atraso pra reagir a um olhar deliberado.
+    tempo_para_mover_s: float = 0.09
 
     # --- Raio de tolerancia do cursor ---
     # Um circulo vermelho acompanha o cursor na tela, do tamanho deste raio (em pixels).
@@ -134,10 +132,20 @@ class FiltroUmEuro:
 
 
 class SuavizadorDeOlhar:
-    """Junta mediana movel + One Euro + zona morta para transformar o olhar cru em cursor estavel."""
+    """Junta mediana movel + One Euro + zona morta com espera (debounce) para virar cursor estavel.
+
+    O olho nunca fica de fato parado: mesmo numa fixacao ele faz microssacadas, tremores
+    involuntarios de poucos pixels equivalentes. Sem tratar isso, toda pequena microssacada
+    que passa da zona morta faz o cursor "pular" de novo, entao ele parece estar sempre se
+    movendo mesmo com o olhar fixo num ponto. A correcao e a mesma usada em eye trackers de
+    verdade: uma nova posicao so e aceita se ela se MANTIVER fora da zona morta por um tempo
+    minimo (`tempo_para_mover`) — uma microssacada isolada nao dura tempo suficiente pra
+    passar desse teste, mas um olhar deliberado para outro lugar sim.
+    """
 
     def __init__(self, config: Configuracoes, x_inicial: float, y_inicial: float) -> None:
         self.zona_morta_px = config.zona_morta_px
+        self.tempo_para_mover = config.tempo_para_mover_s
         self._amostras_x: deque[float] = deque(maxlen=config.janela_mediana)
         self._amostras_y: deque[float] = deque(maxlen=config.janela_mediana)
         self._filtro_x = FiltroUmEuro(config.corte_minimo, config.beta_velocidade, config.corte_velocidade)
@@ -145,12 +153,16 @@ class SuavizadorDeOlhar:
         self._x_publicado = x_inicial
         self._y_publicado = y_inicial
         self._ultimo_instante: float | None = None
+        self._candidato: tuple[float, float] | None = None
+        self._inicio_candidato: float | None = None
 
     def esquecer_historico(self) -> None:
         """Chamado quando o rastreamento se perde: evita um salto gigante ao voltar."""
         self._amostras_x.clear()
         self._amostras_y.clear()
         self._ultimo_instante = None
+        self._candidato = None
+        self._inicio_candidato = None
 
     def atualizar(self, alvo_x: float, alvo_y: float) -> tuple[float, float, bool]:
         agora = time.monotonic()
@@ -165,12 +177,26 @@ class SuavizadorDeOlhar:
         suave_x = self._filtro_x.aplicar(mediana_x, dt)
         suave_y = self._filtro_y.aplicar(mediana_y, dt)
 
-        distancia = math.hypot(suave_x - self._x_publicado, suave_y - self._y_publicado)
-        if distancia < self.zona_morta_px:
+        distancia_da_ancora = math.hypot(suave_x - self._x_publicado, suave_y - self._y_publicado)
+        if distancia_da_ancora < self.zona_morta_px:
+            self._candidato = None
+            self._inicio_candidato = None
+            return self._x_publicado, self._y_publicado, False
+
+        if self._candidato is None or math.hypot(suave_x - self._candidato[0], suave_y - self._candidato[1]) > self.zona_morta_px:
+            # Direcao nova (ou primeira saida da zona morta): reinicia a contagem do tempo de espera.
+            self._candidato = (suave_x, suave_y)
+            self._inicio_candidato = agora
+            return self._x_publicado, self._y_publicado, False
+
+        if agora - self._inicio_candidato < self.tempo_para_mover:
+            # Ainda dentro do tempo de espera: pode ser microssacada, nao move ainda.
             return self._x_publicado, self._y_publicado, False
 
         self._x_publicado = suave_x
         self._y_publicado = suave_y
+        self._candidato = None
+        self._inicio_candidato = None
         return suave_x, suave_y, True
 
 
@@ -305,6 +331,27 @@ def razao_iris_no_olho(pontos_rosto, canto_a: int, canto_b: int, topo: int, base
     return razao_x, razao_y
 
 
+def calcular_inclinacao_da_cabeca(pontos_rosto):
+    """Aproxima o quanto a cabeca esta inclinada para cima/baixo (pitch), em 2D.
+
+    Quando voce inclina a cabeca para baixo, a ponta do nariz se move para baixo em
+    relacao a linha dos olhos (efeito de perspectiva simples); para cima, o oposto.
+    Normalizado pela distancia entre os olhos para nao depender de quao perto voce
+    esta da camera. Diferente do movimento vertical da iris dentro do olho (que se
+    mostrou, na pratica, sem correlacao usavel nesta configuracao de camera), a
+    inclinacao da cabeca e um movimento amplo e voluntario, com sinal bem mais forte.
+    """
+    canto_direito = pontos_rosto[OLHO_DIREITO_CANTO_EXTERNO]
+    canto_esquerdo = pontos_rosto[OLHO_ESQUERDO_CANTO_EXTERNO]
+    nariz = pontos_rosto[NARIZ_PONTA]
+
+    centro_olhos_y = (canto_direito.y + canto_esquerdo.y) / 2
+    distancia_entre_olhos = math.hypot(
+        canto_esquerdo.x - canto_direito.x, canto_esquerdo.y - canto_direito.y
+    )
+    return (nariz.y - centro_olhos_y) / max(distancia_entre_olhos, 1e-6)
+
+
 def estimar_ponto_de_olhar(pontos_rosto):
     razao_x_direito, razao_y_direito = razao_iris_no_olho(
         pontos_rosto,
@@ -328,49 +375,17 @@ def estimar_ponto_de_olhar(pontos_rosto):
 
 
 def calcular_features_de_olhar(pontos_rosto):
-    """Combina a posicao da iris com uma pista da pose da cabeca.
+    """Controle hibrido: eixo horizontal pela posicao da iris (funciona bem), eixo
+    vertical pela inclinacao da cabeca (a iris sozinha nao carrega sinal vertical
+    usavel nesta configuracao de camera — confirmado com dados reais de calibracao).
 
-    A posicao da iris dentro do olho, por si so, muda muito quando a cabeca se move
-    (nao so quando os olhos se movem). Incluir a posicao do nariz dentro do contorno
-    do rosto deixa a regressao de calibracao aprender parte dessa compensacao.
+    Ou seja: olhe para os lados normalmente, mas incline a cabeca para cima/baixo
+    (como se olhasse por cima ou por baixo de um oculos) para mover o cursor
+    verticalmente.
     """
-    razao_x, razao_y = estimar_ponto_de_olhar(pontos_rosto)
-
-    nariz = pontos_rosto[NARIZ_PONTA]
-    tempora_esquerda = pontos_rosto[ROSTO_TEMPORA_ESQUERDA]
-    tempora_direita = pontos_rosto[ROSTO_TEMPORA_DIREITA]
-    testa = pontos_rosto[ROSTO_TESTA]
-    queixo = pontos_rosto[ROSTO_QUEIXO]
-
-    largura_rosto = max(tempora_direita.x - tempora_esquerda.x, 1e-6)
-    altura_rosto = max(queixo.y - testa.y, 1e-6)
-
-    pose_x = (nariz.x - tempora_esquerda.x) / largura_rosto
-    pose_y = (nariz.y - testa.y) / altura_rosto
-
-    return razao_x, razao_y, pose_x, pose_y
-
-
-def expandir_features_de_olhar(features_brutas):
-    """Acrescenta interacao e termos quadraticos de razao_x/razao_y.
-
-    Diagnostico real mostrou que olhar mais para os lados tambem distorce a leitura
-    vertical da iris (efeito geometrico de uma unica camera 2D, nao ruido aleatorio):
-    a mesma altura de olhar dava razao_y sistematicamente menor quando razao_x era maior.
-    Um modelo puramente linear em razao_x e razao_y nao capta esse acoplamento; o termo
-    de interacao (razao_x * razao_y) e os quadraticos dao a regressao capacidade de
-    aprender essa distorcao a partir dos proprios pontos de calibracao.
-    """
-    razao_x, razao_y, pose_x, pose_y = features_brutas
-    return (
-        razao_x,
-        razao_y,
-        razao_x * razao_y,
-        razao_x * razao_x,
-        razao_y * razao_y,
-        pose_x,
-        pose_y,
-    )
+    razao_x, _razao_y = estimar_ponto_de_olhar(pontos_rosto)
+    inclinacao = calcular_inclinacao_da_cabeca(pontos_rosto)
+    return razao_x, inclinacao
 
 
 def obter_pontuacao_blendshape(blendshapes, nome: str) -> float:
@@ -478,15 +493,15 @@ def desenhar_olhos(cv2, quadro, pontos_rosto) -> None:
 def desenhar_diagnostico_ao_vivo(cv2, quadro, pontos_rosto, alvo_x, alvo_y, largura_tela, altura_tela) -> None:
     """Mostra os numeros crus do rastreamento na propria janela da camera.
 
-    Serve para diagnosticar de onde vem o erro: se razao_x/razao_y quase nao mudam
-    quando voce move os olhos, o problema e a leitura do olhar em si (camera, distancia,
+    Serve para diagnosticar de onde vem o erro: se razao_x/inclinacao quase nao mudam
+    quando voce move os olhos/cabeca, o problema e a leitura em si (camera, distancia,
     iluminacao), nao a calibracao ou a suavizacao.
     """
-    razao_x, razao_y, pose_x, pose_y = calcular_features_de_olhar(pontos_rosto)
+    razao_x, inclinacao = calcular_features_de_olhar(pontos_rosto)
     rel_x = alvo_x / max(largura_tela - 1, 1)
     rel_y = alvo_y / max(altura_tela - 1, 1)
     linhas = (
-        f"razao_olho x={razao_x:.3f} y={razao_y:.3f}   pose_cabeca x={pose_x:.3f} y={pose_y:.3f}",
+        f"razao_iris x={razao_x:.3f}   inclinacao_cabeca={inclinacao:.3f}",
         f"alvo na tela (fracao) x={rel_x:.3f} y={rel_y:.3f}",
     )
     altura_quadro = quadro.shape[0]
@@ -534,21 +549,22 @@ def _esta_estavel(leituras) -> bool:
         return False
     recentes = leituras[-AMOSTRAS_MINIMAS_POR_PONTO:]
     razao_x = [amostra[0] for amostra in recentes]
-    razao_y = [amostra[1] for amostra in recentes]
-    return statistics.pstdev(razao_x) < DESVIO_MAXIMO_ESTAVEL and statistics.pstdev(razao_y) < DESVIO_MAXIMO_ESTAVEL
+    inclinacao = [amostra[1] for amostra in recentes]
+    return statistics.pstdev(razao_x) < DESVIO_MAXIMO_ESTAVEL and statistics.pstdev(inclinacao) < DESVIO_MAXIMO_ESTAVEL
 
 
 def calibrar_regressao_de_olhar(cv2, np, mp, camera, detector_rosto, proximo_tempo_ms):
-    """Pede para o usuario olhar para uma grade 4x4 de pontos na tela.
+    """Pede para o usuario olhar/inclinar a cabeca para uma grade 4x4 de pontos na tela.
 
-    Cada ponto guarda (posicao da iris + pose da cabeca) -> posicao real na tela.
-    Com 16 pontos ajustamos por minimos quadrados uma regressao linear para X e para Y,
-    o que compensa parte do erro causado por pequenos movimentos de cabeca — algo que
-    uma simples area de controle fixa nao consegue fazer.
+    Controle hibrido: eixo horizontal pela posicao da iris, eixo vertical pela
+    inclinacao da cabeca (ver calcular_features_de_olhar) — a iris sozinha nao
+    carrega sinal vertical usavel nesta configuracao de camera, confirmado com
+    dados reais de calibracao (a razao vertical da iris ficava praticamente achatada
+    entre pontos de topo e de base da tela).
 
-    So aceita ESPACO quando a leitura do olhar ja esta estavel (o texto muda para
-    "pronto"): isso evita capturar o momento em que o olho ainda esta se movendo
-    para o ponto, que e uma das maiores fontes de erro na calibracao.
+    So aceita ESPACO quando a leitura ja esta estavel (o texto muda para "pronto"):
+    isso evita capturar o momento em que o olho/cabeca ainda esta se movendo para o
+    ponto, que e uma das maiores fontes de erro na calibracao.
     Pressione 's' para pular e usar a area de controle fixa padrao.
     """
     largura_janela, altura_janela = 1280, 720
@@ -583,7 +599,7 @@ def calibrar_regressao_de_olhar(cv2, np, mp, camera, detector_rosto, proximo_tem
             cv2.circle(canvas, ponto, 8, cor_ponto, -1)
             cv2.putText(
                 canvas,
-                f"Ponto {indice_ponto + 1}/{len(PONTOS_DE_CALIBRACAO)}: olhe fixo e pressione ESPACO",
+                f"Ponto {indice_ponto + 1}/{len(PONTOS_DE_CALIBRACAO)}: olhe e incline a cabeca ate mirar, pressione ESPACO",
                 (40, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -602,8 +618,17 @@ def calibrar_regressao_de_olhar(cv2, np, mp, camera, detector_rosto, proximo_tem
             )
             cv2.putText(
                 canvas,
-                "Pressione 's' para pular a calibracao",
+                "Horizontal: olhos. Vertical: incline a cabeca para cima/baixo.",
                 (40, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (200, 200, 200),
+                2,
+            )
+            cv2.putText(
+                canvas,
+                "Pressione 's' para pular a calibracao",
+                (40, 170),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (200, 200, 200),
@@ -618,7 +643,7 @@ def calibrar_regressao_de_olhar(cv2, np, mp, camera, detector_rosto, proximo_tem
             if tecla == 32 and pronto:
                 amostras_recentes = leituras[-AMOSTRAS_MINIMAS_POR_PONTO:]
                 mediana = tuple(statistics.median(valor) for valor in zip(*amostras_recentes))
-                linhas_x.append((*expandir_features_de_olhar(mediana), 1.0))
+                linhas_x.append((*mediana, 1.0))
                 alvos_x.append(rel_x)
                 alvos_y.append(rel_y)
                 break
@@ -638,7 +663,7 @@ def imprimir_diagnostico_de_calibracao(np, linhas, alvos_x, alvos_y, pesos_x, pe
     o sinal mudando entre a calibracao e o uso (cabeca em posicao diferente, luz diferente).
     """
     print("\n--- Diagnostico da calibracao ---")
-    print("razao_x  razao_y  pose_x  pose_y  |  alvo_x  alvo_y  |  previsto_x  previsto_y  |  erro_x  erro_y")
+    print("razao_x  inclinacao  |  alvo_x  alvo_y  |  previsto_x  previsto_y  |  erro_x  erro_y")
     erros_x = []
     erros_y = []
     for linha, alvo_x, alvo_y in zip(linhas, alvos_x, alvos_y):
@@ -648,24 +673,24 @@ def imprimir_diagnostico_de_calibracao(np, linhas, alvos_x, alvos_y, pesos_x, pe
         erro_y = previsto_y - alvo_y
         erros_x.append(erro_x)
         erros_y.append(erro_y)
-        razao_x, razao_y, _razao_xy, _razao_x2, _razao_y2, pose_x, pose_y, _bias = linha
+        razao_x, inclinacao, _bias = linha
         print(
-            f"{razao_x:.3f}    {razao_y:.3f}    {pose_x:.3f}   {pose_y:.3f}   |  "
+            f"{razao_x:.3f}    {inclinacao:+.3f}     |  "
             f"{alvo_x:.3f}   {alvo_y:.3f}   |  {previsto_x:+.3f}      {previsto_y:+.3f}      |  "
             f"{erro_x:+.3f}   {erro_y:+.3f}"
         )
 
     faixa_razao_x = max(l[0] for l in linhas) - min(l[0] for l in linhas)
-    faixa_razao_y = max(l[1] for l in linhas) - min(l[1] for l in linhas)
-    print(f"\nFaixa observada de razao_x entre os pontos de calibracao: {faixa_razao_x:.3f}")
-    print(f"Faixa observada de razao_y entre os pontos de calibracao: {faixa_razao_y:.3f}")
-    print("(se essa faixa for pequena, ex: menor que 0.05, o sinal da iris quase nao varia")
-    print(" com o olhar nessa camera/distancia, e nenhuma regressao vai resolver sozinha)")
+    faixa_inclinacao = max(l[1] for l in linhas) - min(l[1] for l in linhas)
+    print(f"\nFaixa observada de razao_x (iris) entre os pontos de calibracao: {faixa_razao_x:.3f}")
+    print(f"Faixa observada de inclinacao (cabeca) entre os pontos de calibracao: {faixa_inclinacao:.3f}")
+    print("(se alguma dessas faixas for pequena, o sinal correspondente quase nao varia,")
+    print(" e nenhuma regressao vai resolver sozinha)")
     print(f"Erro medio absoluto no proprio treino: x={np.mean(np.abs(erros_x)):.3f}  y={np.mean(np.abs(erros_y)):.3f}")
-    nomes_pesos = "razao_x, razao_y, razao_x*razao_y, razao_x^2, razao_y^2, pose_x, pose_y, bias"
+    nomes_pesos = "razao_x, inclinacao, bias"
     print(f"pesos_x ({nomes_pesos}): {[round(float(p), 3) for p in pesos_x]}")
     print(f"pesos_y ({nomes_pesos}): {[round(float(p), 3) for p in pesos_y]}")
-    print("(se o peso de razao_y em pesos_y estiver em 0.0, o eixo vertical do cursor")
+    print("(se o peso de inclinacao em pesos_y estiver em 0.0, o eixo vertical do cursor")
     print(" vira uma constante — e e exatamente isso que trava o cursor no topo/base)")
     print("--- Fim do diagnostico ---\n")
 
@@ -715,7 +740,7 @@ def ajustar_regressao_de_olhar(np, linhas, alvos_x, alvos_y, regularizacao: floa
 
 def criar_calculador_de_alvo_por_regressao(pesos_x, pesos_y, tela_esquerda, tela_topo, largura_tela, altura_tela):
     def calcular(pontos_rosto):
-        features = expandir_features_de_olhar(calcular_features_de_olhar(pontos_rosto)) + (1.0,)
+        features = calcular_features_de_olhar(pontos_rosto) + (1.0,)
         rel_x = limitar(sum(f * p for f, p in zip(features, pesos_x)), 0.0, 1.0)
         rel_y = limitar(sum(f * p for f, p in zip(features, pesos_y)), 0.0, 1.0)
         x = tela_esquerda + rel_x * (largura_tela - 1)

@@ -1,0 +1,6 @@
+# Dependencias extras para o modo experimental com MobileGaze (rede neural leve de
+# estimativa de olhar, via ONNX Runtime). Instale com:
+#   pip install -r requirements-gaze-onnx.txt
+#
+# Bem mais leve que o modo L2CS-Net/torch: onnxruntime tem poucos MB, sem torch.
+onnxruntime>=1.16
